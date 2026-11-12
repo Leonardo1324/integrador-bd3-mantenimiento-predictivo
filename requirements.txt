@@ -7,3 +7,4 @@ python-dotenv>=1.0.1
 pytest>=8.0.0
 cassandra-driver>=3.29.0
 pyasyncore>=1.0.5
+streamlit>=1.30.0
