@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import time
+import altair as alt
 
 import pandas as pd
 import streamlit as st
@@ -103,6 +104,44 @@ def get_cached_cassandra_connection():
     except Exception:
         return None, None
 
+def plot_metric(df, value_col, y_label, yellow, red):
+    data = df[["window_start", "machine_id", value_col]].dropna()
+
+    lines = (
+        alt.Chart(data)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("window_start:T", title="Hora (ventanas de 5 min)"),
+            y=alt.Y(f"{value_col}:Q", title=y_label, scale=alt.Scale(zero=False)),
+            color=alt.Color("machine_id:N", title="Máquina"),
+            tooltip=[
+                alt.Tooltip("machine_id:N", title="Máquina"),
+                alt.Tooltip("window_start:T", title="Hora"),
+                alt.Tooltip(f"{value_col}:Q", title=y_label, format=".2f"),
+            ],
+        )
+    )
+
+    thresholds = pd.DataFrame(
+        {"nivel": ["Advertencia", "Crítico"], "valor": [yellow, red]}
+    )
+    rules = (
+        alt.Chart(thresholds)
+        .mark_rule(strokeDash=[6, 4], strokeWidth=2)
+        .encode(
+            y="valor:Q",
+            color=alt.Color(
+                "nivel:N",
+                title="Umbral",
+                scale=alt.Scale(
+                    domain=["Advertencia", "Crítico"],
+                    range=["#f59e0b", "#ef4444"],
+                ),
+            ),
+        )
+    )
+
+    st.altair_chart((lines + rules).interactive(), use_container_width=True)
 
 def query_postgres_data() -> tuple[bool, pd.DataFrame, pd.DataFrame]:
     """Consultar estados de riesgo actuales y métricas de 5 minutos desde Azure PostgreSQL."""
@@ -157,6 +196,8 @@ def query_postgres_data() -> tuple[bool, pd.DataFrame, pd.DataFrame]:
             metrics_df = pd.DataFrame(cur.fetchall(), columns=metrics_cols)
             if not metrics_df.empty:
                 metrics_df["window_start"] = pd.to_datetime(metrics_df["window_start"])
+                for col in ["avg_temp", "max_vibration", "avg_pressure"]:
+                    metrics_df[col] = pd.to_numeric(metrics_df[col], errors="coerce")
 
         conn.close()
         return True, risk_df, metrics_df
@@ -421,19 +462,13 @@ if not pg_metrics_df.empty:
     ])
 
     with pg_tab1:
-        st.caption(r"Umbrales de Alerta: Amarillo $\ge 89.5^\circ\text{C}$ | Rojo $\ge 94.0^\circ\text{C}$")
-        pivot_pg_temp = pg_metrics_df.pivot(index="window_start", columns="machine_id", values="avg_temp")
-        st.line_chart(pivot_pg_temp)
+        plot_metric(pg_metrics_df, "avg_temp", "Temperatura promedio (°C)", 89.5, 94.0)
 
     with pg_tab2:
-        st.caption(r"Umbrales de Alerta: Amarillo $\ge 6.0\text{ mm/s}$ | Rojo $\ge 6.8\text{ mm/s}$")
-        pivot_pg_vib = pg_metrics_df.pivot(index="window_start", columns="machine_id", values="max_vibration")
-        st.line_chart(pivot_pg_vib)
+        plot_metric(pg_metrics_df, "max_vibration", "Vibración máxima (mm/s)", 6.0, 6.8)
 
     with pg_tab3:
-        st.caption(r"Umbrales de Alerta: Amarillo $\ge 8.0\text{ bar}$ | Rojo $\ge 8.6\text{ bar}$")
-        pivot_pg_pres = pg_metrics_df.pivot(index="window_start", columns="machine_id", values="avg_pressure")
-        st.line_chart(pivot_pg_pres)
+        plot_metric(pg_metrics_df, "avg_pressure", "Presión promedio (bar)", 8.0, 8.6)
 
     with pg_tab4:
         st.dataframe(pg_risk_df, use_container_width=True, hide_index=True)
