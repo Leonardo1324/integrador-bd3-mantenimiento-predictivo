@@ -224,3 +224,6 @@ artifacts/
 spark-warehouse/
 metastore_db/
 derby.log
+
+# Datos en vivo / búfer de streaming local
+data/live/

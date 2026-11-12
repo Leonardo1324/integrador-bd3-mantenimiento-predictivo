@@ -219,44 +219,50 @@ def upsert_mongodb(alerts_path: Path):
         client.close()
 
 
+def init_cassandra_alerts_table(session):
+    """Asegurar la tabla de alertas y devolver la consulta preparada de inserción."""
+    session.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alerts (
+            machine_id text,
+            timestamp timestamp,
+            level text,
+            description text,
+            PRIMARY KEY ((machine_id), timestamp)
+        ) WITH CLUSTERING ORDER BY (timestamp DESC);
+        """
+    )
+    return session.prepare(
+        """
+        INSERT INTO alerts (machine_id, timestamp, level, description)
+        VALUES (?, ?, ?, ?);
+        """
+    )
+
+
+def insert_cassandra_alert_live(session, prepared_insert, machine_id: str, ts_datetime, level: str, description: str):
+    """Insertar una alerta individual directamente en Azure Cosmos DB Cassandra."""
+    session.execute(prepared_insert, (machine_id, ts_datetime, level, description))
+
+
 def upsert_cassandra(alerts_path: Path):
     """Cargar alertas JSONL en Azure Cosmos DB (Cassandra API) de forma idempotente."""
     cluster, session = get_cassandra_session()
     try:
-        # Asegurar tabla en caso de que aún no exista en el keyspace
-        session.execute(
-            """
-            CREATE TABLE IF NOT EXISTS alerts (
-                machine_id text,
-                timestamp timestamp,
-                level text,
-                description text,
-                PRIMARY KEY ((machine_id), timestamp)
-            ) WITH CLUSTERING ORDER BY (timestamp DESC);
-            """
-        )
-
-        prepared_insert = session.prepare(
-            """
-            INSERT INTO alerts (machine_id, timestamp, level, description)
-            VALUES (?, ?, ?, ?);
-            """
-        )
-
+        prepared_insert = init_cassandra_alerts_table(session)
         loaded_count = 0
         with open(alerts_path, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     doc = json.loads(line)
                     ts = pd.to_datetime(doc["timestamp"], utc=True).to_pydatetime()
-                    session.execute(
+                    insert_cassandra_alert_live(
+                        session,
                         prepared_insert,
-                        (
-                            doc["machine_id"],
-                            ts,
-                            doc.get("level", "AMARILLO"),
-                            doc.get("description", ""),
-                        ),
+                        doc["machine_id"],
+                        ts,
+                        doc.get("level", "AMARILLO"),
+                        doc.get("description", ""),
                     )
                     loaded_count += 1
 
