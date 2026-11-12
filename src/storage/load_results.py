@@ -29,14 +29,26 @@ def required_env(name: str) -> str:
 
 
 def get_pg_connection():
-    """Abrir una conexión a PostgreSQL con la configuración local."""
+    """Abrir una conexión a PostgreSQL (soporta Azure con SSL y entorno local)."""
+    host = os.getenv("PG_HOST") or os.getenv("POSTGRES_HOST", "localhost")
+    port = os.getenv("PG_PORT") or os.getenv("POSTGRES_PORT", "5432")
+    user = os.getenv("PG_USER") or os.getenv("POSTGRES_USER", "admin_bd3")
+    password = os.getenv("PG_PASSWORD") or os.getenv("POSTGRES_PASSWORD")
+    if not password:
+        raise ValueError("Falta configurar PG_PASSWORD o POSTGRES_PASSWORD en el entorno o en .env.")
+    dbname = os.getenv("PG_DB") or os.getenv("POSTGRES_DB", "mantenimiento_predictivo")
+
+    default_ssl = "require" if "azure.com" in host else "prefer"
+    sslmode = os.getenv("PG_SSLMODE") or os.getenv("POSTGRES_SSLMODE", default_ssl)
+
     return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=os.getenv("POSTGRES_PORT", "5432"),
-        user=os.getenv("POSTGRES_USER", "admin_bd3"),
-        password=required_env("POSTGRES_PASSWORD"),
-        dbname=os.getenv("POSTGRES_DB", "mantenimiento_predictivo"),
-        connect_timeout=5,
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        dbname=dbname,
+        sslmode=sslmode,
+        connect_timeout=15,
     )
 
 
@@ -72,6 +84,42 @@ def get_cassandra_session():
     )
     session = cluster.connect(keyspace)
     return cluster, session
+
+
+def upload_to_azure_blob(local_path: Path, blob_prefix: str = "processed"):
+    """Subir un archivo o carpeta Parquet/CSV/JSONL a Azure Blob Storage."""
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    if not conn_str or "TU_CUENTA" in conn_str:
+        return
+
+    from azure.storage.blob import BlobServiceClient
+
+    container_name = os.getenv("AZURE_STORAGE_CONTAINER", "datalake")
+    blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+    container_client = blob_service_client.get_container_client(container_name)
+
+    if not container_client.exists():
+        container_client.create_container()
+
+    files_to_upload = (
+        [p for p in local_path.rglob("*") if p.is_file() and not p.name.startswith(".")]
+        if local_path.is_dir()
+        else [local_path]
+    )
+
+    uploaded = 0
+    for file_item in files_to_upload:
+        rel_name = (
+            file_item.relative_to(local_path).as_posix()
+            if local_path.is_dir()
+            else file_item.name
+        )
+        blob_name = f"{blob_prefix}/{rel_name}"
+        with open(file_item, "rb") as data:
+            container_client.upload_blob(name=blob_name, data=data, overwrite=True)
+            uploaded += 1
+
+    print(f"[Azure Blob Storage] Subidos {uploaded} archivos desde '{local_path.name}' a '{container_name}/{blob_prefix}/'.")
 
 
 def load_dataframe(file_path: Path) -> pd.DataFrame:
@@ -182,7 +230,7 @@ def upsert_postgres(metrics_path: Path, risk_path: Path, *, batch_id: str | None
                     legacy = cur.fetchone()
                     if legacy:
                         raise ValueError(f"El riesgo previo de {legacy[0]} no tiene ventana de origen verificable.")
-        print(f"[PostgreSQL] Carga exitosa: {len(metrics_rows)} metricas y {len(risk_rows)} estados de riesgo.")
+        print(f"[Azure PostgreSQL] Carga exitosa: {len(metrics_rows)} metricas y {len(risk_rows)} estados de riesgo.")
     finally:
         conn.close()
 
@@ -277,6 +325,7 @@ if __name__ == "__main__":
         base_sample / "sensor_metrics_5m_sample.csv",
         base_sample / "machine_risk_latest_sample.csv",
     )
-    upsert_mongodb(base_sample / "alerts_sample.jsonl")
     if os.getenv("CASSANDRA_HOST") and os.getenv("CASSANDRA_PASSWORD"):
         upsert_cassandra(base_sample / "alerts_sample.jsonl")
+    if os.getenv("AZURE_STORAGE_CONNECTION_STRING"):
+        upload_to_azure_blob(base_sample, blob_prefix="sample")

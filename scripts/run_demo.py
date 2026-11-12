@@ -5,9 +5,15 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
+import sys
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from src.generator.generate import DEFAULT_START_TIME, GenerationConfig, generate_telemetry
 from src.ingestion.ingest import ingest_telemetry_batch
@@ -32,7 +38,7 @@ def prepare_batch(work_dir: Path, input_path: Path | None, start_time: str, seed
         source = stage / "telemetry.jsonl"
         if input_path is None:
             generate_telemetry(GenerationConfig(machines=3, days=1 / 24, seed=seed, output=source,
-                                               start_time=start_time))
+                                                start_time=start_time))
         else:
             shutil.copyfile(input_path, source)
 
@@ -64,7 +70,7 @@ def prepare_batch(work_dir: Path, input_path: Path | None, start_time: str, seed
         }
         if (ingestion.valid_records != result.quality.metrics.received
                 or balance["received"] != sum(balance[key] for key in
-                                               ("ingestion_rejected", "spark_rejected", "valid"))):
+                                              ("ingestion_rejected", "spark_rejected", "valid"))):
             raise ValueError(
                 f"Los conteos de ingesta y Spark no concilian. Balance: {balance}. "
                 f"Aceptados en ingesta: {ingestion.valid_records}."
@@ -95,35 +101,50 @@ def prepare_batch(work_dir: Path, input_path: Path | None, start_time: str, seed
 
 
 def load_batch(batch_dir: Path, batch_id: str) -> None:
-    """Cargar un lote exportado en PostgreSQL antes de publicar sus alertas."""
+    """Cargar un lote exportado en Azure PostgreSQL, Azure Cassandra y Azure Blob Storage."""
     from psycopg2 import Error as PostgreSQLError
-
-    import os
-    from src.storage.load_results import upsert_cassandra, upsert_mongodb, upsert_postgres
+    from src.storage.load_results import (
+        upload_to_azure_blob,
+        upsert_cassandra,
+        upsert_mongodb,
+        upsert_postgres,
+    )
 
     results = batch_dir / "results"
     alerts = results / ALERTS_FILE
     if not alerts.is_file():
         raise FileNotFoundError(f"Falta el archivo de alertas del lote: {alerts}")
+
+    # 1. Carga en Azure PostgreSQL
     try:
         upsert_postgres(results / METRICS_FILE, results / RISK_FILE, batch_id=batch_id)
     except PostgreSQLError as error:
         raise RuntimeError(
             f'Falló la carga en PostgreSQL. Corregí el error y reintentá con --load-only "{batch_dir}".'
         ) from error
-    try:
-        upsert_mongodb(alerts)
-    except Exception as error:
-        raise RuntimeError(
-            f'PostgreSQL confirmó el lote; MongoDB quedó pendiente. Reintentá con --load-only "{batch_dir}".'
-        ) from error
 
-    # Si están configuradas las credenciales de Azure Cosmos DB Cassandra, persistir en la nube
+    # 2. Carga en Azure Cosmos DB (Cassandra API)
     if os.getenv("CASSANDRA_HOST") and os.getenv("CASSANDRA_PASSWORD"):
         try:
             upsert_cassandra(alerts)
         except Exception as error:
-            print(f"[Aviso] No se pudo cargar en Azure Cassandra: {error}")
+            raise RuntimeError(
+                f'PostgreSQL confirmó el lote; Azure Cassandra falló. Reintentá con --load-only "{batch_dir}".'
+            ) from error
+
+    # 3. Subida de Parquet, JSONL y Manifest a Azure Blob Storage (Data Lake)
+    if os.getenv("AZURE_STORAGE_CONNECTION_STRING"):
+        try:
+            upload_to_azure_blob(batch_dir, blob_prefix=f"batches/{batch_id[:12]}")
+        except Exception as error:
+            print(f"[Aviso] No se pudo subir el lote a Azure Blob Storage: {error}")
+
+    # 4. MongoDB local (opcional: no detiene la ejecución si Docker está apagado)
+    if os.getenv("MONGO_INITDB_ROOT_PASSWORD"):
+        try:
+            upsert_mongodb(alerts)
+        except Exception as error:
+            print(f"[Info] MongoDB local omitido (Docker apagado): {error.__class__.__name__}")
 
 
 def main() -> int:
@@ -135,7 +156,7 @@ def main() -> int:
     parser.add_argument("--thresholds", type=Path, help="JSON de umbrales. Por defecto usa las reglas del PR #3.")
     parser.add_argument("--work-dir", type=Path, default=Path("artifacts/pipeline"))
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--load", action="store_true", help="Cargar el lote exportado en PostgreSQL y MongoDB.")
+    mode.add_argument("--load", action="store_true", help="Cargar el lote exportado en Azure y bases configuradas.")
     mode.add_argument("--load-only", type=Path, help="Cargar o reintentar a partir de un directorio de lote existente.")
     args = parser.parse_args()
 

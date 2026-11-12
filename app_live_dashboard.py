@@ -1,16 +1,15 @@
-"""Dashboard interactivo en tiempo real para Monitoreo Predictivo Industrial 4.0 (Fase 4).
+"""Dashboard interactivo en tiempo real e histórico Cloud para Monitoreo Predictivo Industrial 4.0 (Fase 5).
 
-Permite visualizar en vivo durante la defensa del proyecto:
-1. Estado y telemetría instantánea por máquina (Tarjetas Verde / Amarillo / Rojo).
-2. Gráficos de tendencias en tiempo real de temperatura, vibración y presión.
-3. Tabla de alertas consumida directamente desde Azure Cosmos DB (Cassandra API).
-4. Auto-refresco continuo sincronizado con el generador en vivo.
+Integra toda la arquitectura en Azure:
+1. Estado y telemetría por máquina (en vivo o desde Azure Database for PostgreSQL).
+2. Curvas históricas de ventanas de 5 minutos procesadas por PySpark (Azure PostgreSQL).
+3. Tabla de alertas en tiempo real consumida desde Azure Cosmos DB (Cassandra API).
+4. Estado del Data Lake en Azure Blob Storage.
 
 Ejecución:
-    streamlit run app_live_dashboard.py
+    .venv\\Scripts\\streamlit run app_live_dashboard.py
 """
 
-from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -20,7 +19,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.storage.load_results import get_cassandra_session
+from src.storage.load_results import get_cassandra_session, get_pg_connection
 
 load_dotenv()
 
@@ -30,7 +29,7 @@ LIVE_ALERTS_PATH = DATA_LIVE_DIR / "live_alerts.jsonl"
 LIVE_TELEMETRY_PATH = DATA_LIVE_DIR / "telemetry_stream.jsonl"
 
 st.set_page_config(
-    page_title="Monitoreo Predictivo Industrial 4.0",
+    page_title="Monitoreo Predictivo Industrial 4.0 - Azure Cloud",
     page_icon="🏭",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -101,24 +100,102 @@ def get_cached_cassandra_connection():
     try:
         cluster, session = get_cassandra_session()
         return cluster, session
-    except Exception as exc:
+    except Exception:
         return None, None
 
 
-def load_live_metrics() -> list[dict]:
-    """Cargar las métricas instantáneas más recientes del búfer."""
+def query_postgres_data() -> tuple[bool, pd.DataFrame, pd.DataFrame]:
+    """Consultar estados de riesgo actuales y métricas de 5 minutos desde Azure PostgreSQL."""
+    try:
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            # 1. Estado actual por máquina + última ventana de 5m
+            cur.execute(
+                """
+                SELECT
+                    r.machine_id,
+                    COALESCE(m.machine_name, r.machine_id) AS machine_name,
+                    COALESCE(m.location, 'Planta Principal') AS location,
+                    r.risk_level,
+                    r.risk_reason,
+                    r.calculated_at,
+                    r.window_start,
+                    s.avg_temp,
+                    s.max_vibration,
+                    s.avg_pressure,
+                    s.n_readings
+                FROM machine_risk_latest r
+                LEFT JOIN machines m ON m.machine_id = r.machine_id
+                LEFT JOIN LATERAL (
+                    SELECT avg_temp, max_vibration, avg_pressure, n_readings
+                    FROM sensor_metrics_5m sm
+                    WHERE sm.machine_id = r.machine_id
+                    ORDER BY sm.window_start DESC
+                    LIMIT 1
+                ) s ON TRUE
+                ORDER BY r.machine_id;
+                """
+            )
+            risk_cols = [desc[0] for desc in cur.description]
+            risk_df = pd.DataFrame(cur.fetchall(), columns=risk_cols)
+
+            # 2. Serie histórica de ventanas de 5 minutos (PySpark)
+            cur.execute(
+                """
+                SELECT
+                    machine_id,
+                    window_start,
+                    avg_temp,
+                    max_vibration,
+                    avg_pressure,
+                    n_readings
+                FROM sensor_metrics_5m
+                ORDER BY window_start ASC, machine_id ASC;
+                """
+            )
+            metrics_cols = [desc[0] for desc in cur.description]
+            metrics_df = pd.DataFrame(cur.fetchall(), columns=metrics_cols)
+            if not metrics_df.empty:
+                metrics_df["window_start"] = pd.to_datetime(metrics_df["window_start"])
+
+        conn.close()
+        return True, risk_df, metrics_df
+    except Exception:
+        return False, pd.DataFrame(), pd.DataFrame()
+
+
+def load_live_metrics(pg_risk_df: pd.DataFrame) -> tuple[list[dict], str]:
+    """Cargar métricas instantáneas del generador en vivo o usar el estado de Azure PostgreSQL."""
     if LATEST_METRICS_PATH.exists():
         try:
             content = LATEST_METRICS_PATH.read_text(encoding="utf-8")
             if content.strip():
-                return json.loads(content)
+                return json.loads(content), "Streaming Local en Vivo"
         except Exception:
             pass
-    return []
+
+    if not pg_risk_df.empty:
+        cards = []
+        for row in pg_risk_df.to_dict(orient="records"):
+            cards.append(
+                {
+                    "machine_id": row["machine_id"],
+                    "risk_level": row["risk_level"],
+                    "temperature": float(row["avg_temp"] or 0.0),
+                    "vibration": float(row["max_vibration"] or 0.0),
+                    "pressure": float(row["avg_pressure"] or 0.0),
+                    "machine_state": f"{row['location']} (Ventana 5m)",
+                    "risk_reason": row["risk_reason"],
+                    "timestamp": str(row["window_start"] or row["calculated_at"] or ""),
+                }
+            )
+        return cards, "Azure Database for PostgreSQL"
+
+    return [], "Sin datos"
 
 
 def load_telemetry_history() -> pd.DataFrame:
-    """Cargar la ventana deslizante de telemetría para gráficos."""
+    """Cargar la ventana deslizante de telemetría en vivo para gráficos."""
     if LIVE_TELEMETRY_PATH.exists():
         try:
             lines = LIVE_TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
@@ -132,7 +209,7 @@ def load_telemetry_history() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def query_cloud_alerts(session, limit: int = 15) -> pd.DataFrame:
+def query_cloud_alerts(session, limit: int = 20) -> pd.DataFrame:
     """Consultar las alertas más recientes directamente desde Azure Cosmos DB (Cassandra API)."""
     if session is not None:
         try:
@@ -148,11 +225,11 @@ def query_cloud_alerts(session, limit: int = 15) -> pd.DataFrame:
                 for row in rows
             ]
             if data:
-                return pd.DataFrame(data)
+                df = pd.DataFrame(data)
+                return df.sort_values(by="Fecha y Hora (UTC)", ascending=False)
         except Exception:
             pass
 
-    # Fallback a búfer local si Azure no responde
     if LIVE_ALERTS_PATH.exists():
         try:
             lines = LIVE_ALERTS_PATH.read_text(encoding="utf-8").splitlines()
@@ -176,51 +253,77 @@ def query_cloud_alerts(session, limit: int = 15) -> pd.DataFrame:
 
 
 # ==============================================================================
+# CONSULTA DE DATOS A LA NUBE
+# ==============================================================================
+pg_connected, pg_risk_df, pg_metrics_df = query_postgres_data()
+cluster, session = get_cached_cassandra_connection()
+latest_machines, cards_source = load_live_metrics(pg_risk_df)
+telemetry_df = load_telemetry_history()
+alerts_df = query_cloud_alerts(session, limit=25)
+blob_configured = bool(
+    os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    and "TU_CUENTA" not in os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+)
+
+
+# ==============================================================================
 # SIDEBAR
 # ==============================================================================
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/industrial-scales.png", width=64)
     st.title("Control de Planta")
-    st.caption("Arquitectura Big Data & Cassandra en Azure")
+    st.caption("Arquitectura Híbrida Multi-Base en Azure")
     st.markdown("---")
 
-    # Estado de la conexión a Azure
-    cluster, session = get_cached_cassandra_connection()
+    # 1. Estado Azure PostgreSQL
+    if pg_connected:
+        st.success("🐘 **Azure PostgreSQL**: Conectado")
+        st.caption(f"Host: `{os.getenv('PG_HOST') or os.getenv('POSTGRES_HOST')}`")
+        st.caption(f"Ventanas 5m almacenadas: **{len(pg_metrics_df)}**")
+    else:
+        st.error("⚠️ **Azure PostgreSQL**: Desconectado")
+
+    # 2. Estado Azure Cosmos DB Cassandra
     if session is not None:
-        st.success("☁️ **Azure Cosmos DB**: Conectado")
-        st.caption(f"Host: `{os.getenv('CASSANDRA_HOST', 'cosmos.azure.com')}`")
+        st.success("☁️ **Azure Cassandra**: Conectado")
+        st.caption(f"Host: `{os.getenv('CASSANDRA_HOST')}`")
         st.caption(f"Keyspace: `{os.getenv('CASSANDRA_KEYSPACE', 'bd3_mantenimiento')}.alerts`")
     else:
-        st.warning("⚠️ **Azure Cosmos DB**: Modo local / Desconectado")
+        st.warning("⚠️ **Azure Cassandra**: Modo local / Desconectado")
+
+    # 3. Estado Azure Blob Storage
+    if blob_configured:
+        st.success("📦 **Azure Blob Data Lake**: Configurado")
+        st.caption(f"Contenedor: `{os.getenv('AZURE_STORAGE_CONTAINER', 'datalake')}`")
+    else:
+        st.info("📦 **Azure Blob Data Lake**: No configurado")
 
     st.markdown("---")
     st.subheader("⚙️ Configuración de Vista")
-    auto_refresh = st.checkbox("🔄 Actualización automática", value=True)
-    refresh_rate = st.slider("Intervalo de refresco (segundos)", min_value=1, max_value=10, value=2)
+    auto_refresh = st.checkbox("🔄 Actualización automática", value=False)
+    refresh_rate = st.slider("Intervalo de refresco (segundos)", min_value=2, max_value=15, value=5)
 
     if st.button("⚡ Forzar Actualización Manual", use_container_width=True):
         st.rerun()
 
     st.markdown("---")
     st.info(
-        "💡 **Instrucciones para la Demo:**\n"
-        "1. Dejá corriendo en una terminal:\n"
-        "`python scripts/run_live_demo.py`\n"
-        "2. Este panel se actualizará automáticamente mostrando cómo llegan los datos y se disparan las alertas en Azure."
+        "💡 **Comandos del Proyecto:**\n"
+        "- Lote PySpark hacia Azure:\n"
+        "`python scripts/run_demo.py --load`\n"
+        "- Simulador Streaming en vivo:\n"
+        "`python scripts/run_live_demo.py`"
     )
 
 
 # ==============================================================================
 # CONTENIDO PRINCIPAL
 # ==============================================================================
-st.title("🏭 Monitoreo Predictivo Industrial 4.0 - Live Dashboard")
+st.title("🏭 Monitoreo Predictivo Industrial 4.0 - Cloud Dashboard")
 st.markdown(
-    "Monitoreo continuo de telemetría, detección analítica de anomalías y persistencia en **Azure Cosmos DB (Cassandra API)**."
+    "Arquitectura unificada sobre **Azure Database for PostgreSQL** (históricos 5m y riesgo), "
+    "**Azure Cosmos DB Cassandra** (alertas en tiempo real) y **Azure Blob Storage** (Data Lake Parquet)."
 )
-
-latest_machines = load_live_metrics()
-telemetry_df = load_telemetry_history()
-alerts_df = query_cloud_alerts(session, limit=20)
 
 # ------------------------------------------------------------------------------
 # 1. KPIs SUPERIORES
@@ -233,7 +336,7 @@ total_alerts = len(alerts_df)
 
 kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
 with kpi1:
-    st.metric("Total Máquinas", total_machines if total_machines > 0 else "5")
+    st.metric("Total Máquinas", total_machines)
 with kpi2:
     st.metric("🟢 Normales", green_count)
 with kpi3:
@@ -241,14 +344,14 @@ with kpi3:
 with kpi4:
     st.metric("🔴 Críticas", red_count)
 with kpi5:
-    st.metric("☁️ Alertas en Azure", total_alerts)
+    st.metric("☁️ Alertas en Cassandra", total_alerts)
 
 st.markdown("---")
 
 # ------------------------------------------------------------------------------
-# 2. TARJETAS DE ESTADO POR MÁQUINA EN TIEMPO REAL
+# 2. TARJETAS DE ESTADO POR MÁQUINA
 # ------------------------------------------------------------------------------
-st.subheader("🖥️ Estado Operativo y Sensores por Máquina")
+st.subheader(f"🖥️ Estado Operativo por Máquina (Fuente: {cards_source})")
 
 if latest_machines:
     cols = st.columns(min(len(latest_machines), 5))
@@ -261,7 +364,6 @@ if latest_machines:
         pres = m.get("pressure", 0.0)
         state = m.get("machine_state", "operating")
         reason = m.get("risk_reason", "Operación nominal")
-        ts = m.get("timestamp", "").replace("T", " ").replace("Z", "")
 
         card_class = (
             "metric-card-red"
@@ -286,7 +388,7 @@ if latest_machines:
                         <h4 style="margin: 0;">{m_id}</h4>
                         <span class="{pill_class}">{risk}</span>
                     </div>
-                    <p style="font-size: 0.8rem; color: #a1a1aa; margin: 4px 0 10px 0;">Estado: <b>{state.upper()}</b></p>
+                    <p style="font-size: 0.8rem; color: #a1a1aa; margin: 4px 0 10px 0;">Origen: <b>{state}</b></p>
                     <div style="font-size: 0.95rem; line-height: 1.5;">
                         🌡️ <b>Temp:</b> {temp:.1f} °C<br/>
                         〰️ <b>Vib:</b> {vib:.2f} mm/s<br/>
@@ -300,43 +402,63 @@ if latest_machines:
                 unsafe_allow_html=True,
             )
 else:
-    st.info("Esperando datos del generador en vivo... Ejecutá `python scripts/run_live_demo.py` para comenzar a recibir telemetría.")
+    st.info("Ejecutá `python scripts/run_demo.py --load` o `python scripts/run_live_demo.py` para visualizar las máquinas.")
 
 st.markdown("---")
 
 # ------------------------------------------------------------------------------
-# 3. GRÁFICOS DE TENDENCIAS EN TIEMPO REAL
+# 3. MÉTRICAS HISTÓRICAS DE 5 MINUTOS (AZURE POSTGRESQL + PYSPARK)
 # ------------------------------------------------------------------------------
-st.subheader("📈 Tendencias de Sensores en Vivo")
+st.subheader("🐘 Agregaciones Históricas en Ventanas de 5 Minutos (Azure PostgreSQL)")
+st.caption("Datos procesados por PySpark y consultados en vivo desde las tablas `sensor_metrics_5m` y `machine_risk_latest`.")
 
-if not telemetry_df.empty:
-    tab1, tab2, tab3 = st.tabs(["🌡️ Temperatura (°C)", "〰️ Vibración (mm/s)", "💨 Presión (bar)"])
+if not pg_metrics_df.empty:
+    pg_tab1, pg_tab2, pg_tab3, pg_tab4 = st.tabs([
+        "🌡️ Temp. Promedio 5m (°C)",
+        "〰️ Vibración Máx. 5m (mm/s)",
+        "💨 Presión Promedio 5m (bar)",
+        "📋 Catálogo y Estado Consolidado (SQL)",
+    ])
 
-    # Pivotear para graficar series por máquina
-    with tab1:
+    with pg_tab1:
         st.caption(r"Umbrales de Alerta: Amarillo $\ge 89.5^\circ\text{C}$ | Rojo $\ge 94.0^\circ\text{C}$")
-        pivot_temp = telemetry_df.pivot(index="timestamp", columns="machine_id", values="temperature")
-        st.line_chart(pivot_temp)
+        pivot_pg_temp = pg_metrics_df.pivot(index="window_start", columns="machine_id", values="avg_temp")
+        st.line_chart(pivot_pg_temp)
 
-    with tab2:
+    with pg_tab2:
         st.caption(r"Umbrales de Alerta: Amarillo $\ge 6.0\text{ mm/s}$ | Rojo $\ge 6.8\text{ mm/s}$")
-        pivot_vib = telemetry_df.pivot(index="timestamp", columns="machine_id", values="vibration")
-        st.line_chart(pivot_vib)
+        pivot_pg_vib = pg_metrics_df.pivot(index="window_start", columns="machine_id", values="max_vibration")
+        st.line_chart(pivot_pg_vib)
 
-    with tab3:
+    with pg_tab3:
         st.caption(r"Umbrales de Alerta: Amarillo $\ge 8.0\text{ bar}$ | Rojo $\ge 8.6\text{ bar}$")
-        pivot_pres = telemetry_df.pivot(index="timestamp", columns="machine_id", values="pressure")
-        st.line_chart(pivot_pres)
+        pivot_pg_pres = pg_metrics_df.pivot(index="window_start", columns="machine_id", values="avg_pressure")
+        st.line_chart(pivot_pg_pres)
+
+    with pg_tab4:
+        st.dataframe(pg_risk_df, use_container_width=True, hide_index=True)
 else:
-    st.info("Aún no hay historial suficiente para graficar tendencias en vivo.")
+    st.warning("No se encontraron registros en `sensor_metrics_5m` de Azure PostgreSQL.")
+
+# Si además está corriendo el simulador en vivo, mostrar sus curvas instantáneas
+if not telemetry_df.empty:
+    st.markdown("---")
+    st.subheader("📈 Stream de Sensores Segundo a Segundo (Buffer en Vivo)")
+    live_tab1, live_tab2, live_tab3 = st.tabs(["🌡️ Temperatura Vivo", "〰️ Vibración Vivo", "💨 Presión Vivo"])
+    with live_tab1:
+        st.line_chart(telemetry_df.pivot(index="timestamp", columns="machine_id", values="temperature"))
+    with live_tab2:
+        st.line_chart(telemetry_df.pivot(index="timestamp", columns="machine_id", values="vibration"))
+    with live_tab3:
+        st.line_chart(telemetry_df.pivot(index="timestamp", columns="machine_id", values="pressure"))
 
 st.markdown("---")
 
 # ------------------------------------------------------------------------------
 # 4. HISTORIAL DE ALERTAS DIRECTO DE AZURE COSMOS DB CASSANDRA
 # ------------------------------------------------------------------------------
-st.subheader("☁️ Registro de Alertas en Azure Cosmos DB (Cassandra API)")
-st.caption("Consultado en tiempo real desde la tabla `alerts` en el keyspace `bd3_mantenimiento`.")
+st.subheader("☁️ Registro de Alertas en Tiempo Real (Azure Cosmos DB for Apache Cassandra)")
+st.caption("Consultado directamente desde la tabla `alerts` en el keyspace `bd3_mantenimiento`.")
 
 if not alerts_df.empty:
     def highlight_level(val):

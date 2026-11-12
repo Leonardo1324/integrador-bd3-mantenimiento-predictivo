@@ -1,12 +1,15 @@
-"""Script de demostración en tiempo real (Fase 3).
+"""Script de demostración en tiempo real (Fase 3 / Fase 5 Cloud).
 
 Genera lecturas continuas con timestamp actual en UTC (now()), evalúa umbrales
-analíticos de riesgo y persiste las alertas anómalas en vivo directamente en
-Azure Cosmos DB (Cassandra API) y en el búfer local para el frontend de monitoreo.
+analíticos de riesgo y persiste tanto las alertas en Azure Cosmos DB (Cassandra API)
+como el estado y telemetría instantánea en Azure Database for PostgreSQL y el búfer local.
+
+Esto permite que el Dashboard desplegado en Streamlit Community Cloud se actualice
+en vivo desde cualquier dispositivo mientras este script corre en una PC local.
 
 Uso:
     python scripts/run_live_demo.py
-    python scripts/run_live_demo.py --interval 1.5 --machines 5 --anomaly-rate 0.20
+    python scripts/run_live_demo.py --interval 2.0 --machines 5 --anomaly-rate 0.20
     python scripts/run_live_demo.py --max-ticks 10
 """
 
@@ -24,11 +27,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd
+from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
 from src.generator.live_generator import LiveTelemetryGenerator, current_utc_moment
 from src.storage.load_results import (
     get_cassandra_session,
+    get_pg_connection,
     init_cassandra_alerts_table,
     insert_cassandra_alert_live,
 )
@@ -41,20 +46,32 @@ LIVE_ALERTS_PATH = DATA_LIVE_DIR / "live_alerts.jsonl"
 LIVE_TELEMETRY_PATH = DATA_LIVE_DIR / "telemetry_stream.jsonl"
 
 
-def print_banner(machines: int, interval: float, anomaly_rate: float, azure_active: bool) -> None:
+def print_banner(
+    machines: int,
+    interval: float,
+    anomaly_rate: float,
+    cassandra_active: bool,
+    postgres_active: bool,
+) -> None:
     print("\n" + "=" * 76)
-    print("   SISTEMA BIG DATA: GENERADOR Y PIPELINE EN TIEMPO REAL (FASE 3)")
+    print("   SISTEMA BIG DATA: GENERADOR Y PIPELINE EN TIEMPO REAL (CLOUD SYNC)")
     print("=" * 76)
     print(f"  * Intervalo entre emisiones: {interval} segundos")
     print(f"  * Máquinas monitoreadas:     {machines} (MAQ-001 .. MAQ-{machines:03d})")
     print(f"  * Tasa de anomalías:         {anomaly_rate * 100:.1f}%")
-    if azure_active:
+    if cassandra_active:
         host = os.getenv("CASSANDRA_HOST", "basededatos3.cassandra.cosmos.azure.com")
         ks = os.getenv("CASSANDRA_KEYSPACE", "bd3_mantenimiento")
-        print(f"  * Nube de alertas:           Azure Cosmos DB (Cassandra API)")
-        print(f"  * Host / Keyspace:           {host} | {ks}.alerts")
+        print(f"  * Nube de alertas (NoSQL):   Azure Cosmos DB Cassandra ({host} | {ks}.alerts)")
     else:
-        print("  * Nube de alertas:           MODO LOCAL (sin conexión a Azure)")
+        print("  * Nube de alertas (NoSQL):   MODO LOCAL (sin conexión a Azure Cassandra)")
+
+    if postgres_active:
+        pg_host = os.getenv("PG_HOST") or os.getenv("POSTGRES_HOST", "azure.com")
+        print(f"  * Nube de estado (SQL):      Azure PostgreSQL ({pg_host})")
+    else:
+        print("  * Nube de estado (SQL):      MODO LOCAL (sin conexión a Azure PostgreSQL)")
+
     print(f"  * Directorio búfer en vivo:  {DATA_LIVE_DIR.resolve()}")
     print("=" * 76)
     print("  [PRESIONA CTRL+C PARA DETENER LA TRANSMISIÓN EN CUALQUIER MOMENTO]\n")
@@ -65,7 +82,7 @@ def update_live_buffer(
     alerts: list[dict],
     latest_state: dict[str, dict],
 ) -> None:
-    """Actualizar archivos de búfer para que el frontend pueda consumirlos en vivo."""
+    """Actualizar archivos de búfer local y el diccionario latest_state."""
     DATA_LIVE_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. Actualizar estado instantáneo por máquina
@@ -112,6 +129,83 @@ def update_live_buffer(
     LIVE_TELEMETRY_PATH.write_text("\n".join(combined) + "\n", encoding="utf-8")
 
 
+def sync_live_to_postgres(pg_conn, latest_state: dict[str, dict], tick_now: datetime) -> None:
+    """Sincronizar el estado instantáneo de las máquinas en Azure PostgreSQL para Streamlit Cloud."""
+    if not pg_conn or not latest_state:
+        return
+
+    machines_rows = [
+        (m_id, f"Equipo {m_id}", "Planta Principal (Live Stream)")
+        for m_id in sorted(latest_state.keys())
+    ]
+    metrics_rows = []
+    risk_rows = []
+
+    for m_id, state in sorted(latest_state.items()):
+        ts = pd.to_datetime(state["timestamp"], utc=True).to_pydatetime()
+        metrics_rows.append(
+            (
+                m_id,
+                ts,
+                float(state["temperature"]),
+                float(state["vibration"]),
+                float(state["pressure"]),
+                1,
+                "live_stream",
+            )
+        )
+        risk_rows.append(
+            (
+                m_id,
+                tick_now,
+                str(state["risk_level"]).upper(),
+                str(state["risk_reason"]),
+                ts,
+            )
+        )
+
+    with pg_conn:
+        with pg_conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO machines (machine_id, machine_name, location)
+                VALUES %s
+                ON CONFLICT (machine_id) DO NOTHING;
+                """,
+                machines_rows,
+            )
+            execute_values(
+                cur,
+                """
+                INSERT INTO sensor_metrics_5m
+                    (machine_id, window_start, avg_temp, max_vibration, avg_pressure, n_readings, batch_id)
+                VALUES %s
+                ON CONFLICT (machine_id, window_start) DO UPDATE SET
+                    avg_temp = EXCLUDED.avg_temp,
+                    max_vibration = EXCLUDED.max_vibration,
+                    avg_pressure = EXCLUDED.avg_pressure,
+                    n_readings = EXCLUDED.n_readings,
+                    batch_id = EXCLUDED.batch_id;
+                """,
+                metrics_rows,
+            )
+            execute_values(
+                cur,
+                """
+                INSERT INTO machine_risk_latest
+                    (machine_id, calculated_at, risk_level, risk_reason, window_start)
+                VALUES %s
+                ON CONFLICT (machine_id) DO UPDATE SET
+                    calculated_at = EXCLUDED.calculated_at,
+                    risk_level = EXCLUDED.risk_level,
+                    risk_reason = EXCLUDED.risk_reason,
+                    window_start = EXCLUDED.window_start;
+                """,
+                risk_rows,
+            )
+
+
 def run_live_stream(
     interval: float = 2.0,
     machines: int = 5,
@@ -119,26 +213,37 @@ def run_live_stream(
     max_ticks: int | None = None,
     no_azure: bool = False,
 ) -> int:
-    """Bucle continuo de generación, detección de anomalías y persistencia en Cassandra."""
+    """Bucle continuo de generación, detección de anomalías y persistencia en Cassandra + PostgreSQL."""
     generator = LiveTelemetryGenerator(machines=machines, anomaly_rate=anomaly_rate)
 
     cluster = None
     session = None
     prepared_insert = None
-    azure_connected = False
+    cassandra_connected = False
+    pg_conn = None
+    postgres_connected = False
 
-    if not no_azure and os.getenv("CASSANDRA_HOST") and os.getenv("CASSANDRA_PASSWORD"):
-        print("[Iniciando] Conectando con Azure Cosmos DB (Cassandra API)...")
-        try:
-            cluster, session = get_cassandra_session()
-            prepared_insert = init_cassandra_alerts_table(session)
-            azure_connected = True
-            print("[Conectado] Sesión con Azure Cosmos DB establecida exitosamente.")
-        except Exception as exc:
-            print(f"[Aviso] No se pudo conectar a Azure Cassandra: {exc}")
-            print("[Modo alternativo] Continuando en modo búfer local.")
+    if not no_azure:
+        if os.getenv("CASSANDRA_HOST") and os.getenv("CASSANDRA_PASSWORD"):
+            print("[Iniciando] Conectando con Azure Cosmos DB (Cassandra API)...")
+            try:
+                cluster, session = get_cassandra_session()
+                prepared_insert = init_cassandra_alerts_table(session)
+                cassandra_connected = True
+                print("[Conectado] Sesión con Azure Cosmos DB establecida exitosamente.")
+            except Exception as exc:
+                print(f"[Aviso] No se pudo conectar a Azure Cassandra: {exc}")
 
-    print_banner(machines, interval, anomaly_rate, azure_connected)
+        if os.getenv("PG_PASSWORD") or os.getenv("POSTGRES_PASSWORD"):
+            print("[Iniciando] Conectando con Azure Database for PostgreSQL...")
+            try:
+                pg_conn = get_pg_connection()
+                postgres_connected = True
+                print("[Conectado] Sesión con Azure PostgreSQL establecida exitosamente.")
+            except Exception as exc:
+                print(f"[Aviso] No se pudo conectar a Azure PostgreSQL: {exc}")
+
+    print_banner(machines, interval, anomaly_rate, cassandra_connected, postgres_connected)
 
     DATA_LIVE_DIR.mkdir(parents=True, exist_ok=True)
     latest_state: dict[str, dict] = {}
@@ -169,7 +274,7 @@ def run_live_stream(
             for alert in tick_alerts:
                 level_tag = "[🚨 ALERTA ROJA]" if alert["level"] == "ROJO" else "[⚠️ ALERTA AMARILLA]"
                 azure_tag = ""
-                if azure_connected and session and prepared_insert:
+                if cassandra_connected and session and prepared_insert:
                     try:
                         ts_dt = pd.to_datetime(alert["timestamp"], utc=True).to_pydatetime()
                         insert_cassandra_alert_live(
@@ -183,11 +288,27 @@ def run_live_stream(
                         total_alerts_stored += 1
                         azure_tag = " -> [☁️ AZURE CASSANDRA PERSISTIDA]"
                     except Exception as err:
-                        azure_tag = f" -> [ERROR AZURE: {err}]"
+                        azure_tag = f" -> [ERROR CASSANDRA: {err}]"
 
                 print(
                     f"[{now_iso} UTC] {level_tag} {alert['machine_id']}: {alert['description']}{azure_tag}"
                 )
+
+            # Guardar en búfer local y actualizar latest_state
+            update_live_buffer(readings, tick_alerts, latest_state)
+
+            # Sincronizar estado instantáneo con Azure PostgreSQL para el Dashboard web
+            pg_tag = ""
+            if postgres_connected and pg_conn:
+                try:
+                    sync_live_to_postgres(pg_conn, latest_state, tick_now)
+                    pg_tag = " | [🐘 PG SYNC OK]"
+                except Exception as pg_err:
+                    pg_tag = f" | [PG WARN: {pg_err.__class__.__name__}]"
+                    try:
+                        pg_conn = get_pg_connection()
+                    except Exception:
+                        pass
 
             # Resumen de telemetría de este paso
             summary_items = [
@@ -197,10 +318,7 @@ def run_live_stream(
             if len(readings) > 3:
                 summary_items.append(f"...(+{len(readings) - 3} más)")
             telemetry_str = " | ".join(summary_items)
-            print(f"[{now_iso} UTC] [📡 TELEMETRÍA #{ticks:03d}] {len(readings)} lecturas: {telemetry_str}")
-
-            # Guardar en búfer local para frontend
-            update_live_buffer(readings, tick_alerts, latest_state)
+            print(f"[{now_iso} UTC] [📡 TICK #{ticks:03d}] {len(readings)} maq: {telemetry_str}{pg_tag}")
 
             if max_ticks is not None and ticks >= max_ticks:
                 break
@@ -211,12 +329,17 @@ def run_live_stream(
         print("\n[Detención] Señal de interrupción (Ctrl+C) recibida por el usuario.")
 
     finally:
+        if pg_conn:
+            try:
+                pg_conn.close()
+            except Exception:
+                pass
         if cluster:
             print("[Cierre] Cerrando conexión con Azure Cosmos DB...")
             cluster.shutdown()
 
         print("\n" + "=" * 60)
-        print("          RESUMEN DE TRANSMISIÓN EN TIEMPO REAL")
+        print("           RESUMEN DE TRANSMISIÓN EN TIEMPO REAL")
         print("=" * 60)
         print(f"  * Ciclos ejecutados (ticks):     {ticks}")
         print(f"  * Lecturas de telemetría:        {total_emitted}")
@@ -229,7 +352,7 @@ def run_live_stream(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generador continuo en tiempo real con persistencia de alertas en Azure Cosmos DB (Cassandra API)."
+        description="Generador continuo en tiempo real con persistencia en Azure Cassandra y Azure PostgreSQL."
     )
     parser.add_argument(
         "--interval",
@@ -261,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-azure",
         "--no_azure",
         action="store_true",
-        help="Ejecutar únicamente en modo local sin conectar a Azure Cassandra.",
+        help="Ejecutar únicamente en modo local sin conectar a Azure.",
     )
     return parser
 
