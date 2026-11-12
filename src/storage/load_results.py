@@ -3,11 +3,19 @@ import json
 import math
 from numbers import Integral
 from pathlib import Path
+import ssl
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 from pymongo import MongoClient, UpdateOne
 from dotenv import load_dotenv
+
+try:
+    import asyncore  # Compatibilidad Python 3.12 para cassandra-driver
+except ImportError:
+    pass
+from cassandra.auth import PlainTextAuthProvider
+from cassandra.cluster import Cluster
 
 load_dotenv()
 
@@ -42,6 +50,28 @@ def get_mongo_client():
         authSource="admin",
         serverSelectionTimeoutMS=5000,
     )
+
+
+def get_cassandra_session():
+    """Abrir una sesión autenticada con SSL hacia Azure Cosmos DB (Cassandra API)."""
+    contact_points = [required_env("CASSANDRA_HOST")]
+    port = int(os.getenv("CASSANDRA_PORT", "10350"))
+    user = required_env("CASSANDRA_USER")
+    password = required_env("CASSANDRA_PASSWORD")
+    keyspace = os.getenv("CASSANDRA_KEYSPACE", "bd3_mantenimiento")
+
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    cluster = Cluster(
+        contact_points=contact_points,
+        port=port,
+        auth_provider=PlainTextAuthProvider(username=user, password=password),
+        ssl_context=ssl_context,
+    )
+    session = cluster.connect(keyspace)
+    return cluster, session
 
 
 def load_dataframe(file_path: Path) -> pd.DataFrame:
@@ -189,6 +219,52 @@ def upsert_mongodb(alerts_path: Path):
         client.close()
 
 
+def upsert_cassandra(alerts_path: Path):
+    """Cargar alertas JSONL en Azure Cosmos DB (Cassandra API) de forma idempotente."""
+    cluster, session = get_cassandra_session()
+    try:
+        # Asegurar tabla en caso de que aún no exista en el keyspace
+        session.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alerts (
+                machine_id text,
+                timestamp timestamp,
+                level text,
+                description text,
+                PRIMARY KEY ((machine_id), timestamp)
+            ) WITH CLUSTERING ORDER BY (timestamp DESC);
+            """
+        )
+
+        prepared_insert = session.prepare(
+            """
+            INSERT INTO alerts (machine_id, timestamp, level, description)
+            VALUES (?, ?, ?, ?);
+            """
+        )
+
+        loaded_count = 0
+        with open(alerts_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    doc = json.loads(line)
+                    ts = pd.to_datetime(doc["timestamp"], utc=True).to_pydatetime()
+                    session.execute(
+                        prepared_insert,
+                        (
+                            doc["machine_id"],
+                            ts,
+                            doc.get("level", "AMARILLO"),
+                            doc.get("description", ""),
+                        ),
+                    )
+                    loaded_count += 1
+
+        print(f"[Azure Cassandra] Alertas insertadas en la nube: {loaded_count}")
+    finally:
+        cluster.shutdown()
+
+
 if __name__ == "__main__":
     base_sample = Path("data/sample")
     upsert_postgres(
@@ -196,3 +272,5 @@ if __name__ == "__main__":
         base_sample / "machine_risk_latest_sample.csv",
     )
     upsert_mongodb(base_sample / "alerts_sample.jsonl")
+    if os.getenv("CASSANDRA_HOST") and os.getenv("CASSANDRA_PASSWORD"):
+        upsert_cassandra(base_sample / "alerts_sample.jsonl")

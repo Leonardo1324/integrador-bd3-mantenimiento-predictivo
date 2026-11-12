@@ -98,7 +98,8 @@ def load_batch(batch_dir: Path, batch_id: str) -> None:
     """Cargar un lote exportado en PostgreSQL antes de publicar sus alertas."""
     from psycopg2 import Error as PostgreSQLError
 
-    from src.storage.load_results import upsert_mongodb, upsert_postgres
+    import os
+    from src.storage.load_results import upsert_cassandra, upsert_mongodb, upsert_postgres
 
     results = batch_dir / "results"
     alerts = results / ALERTS_FILE
@@ -116,6 +117,13 @@ def load_batch(batch_dir: Path, batch_id: str) -> None:
         raise RuntimeError(
             f'PostgreSQL confirmó el lote; MongoDB quedó pendiente. Reintentá con --load-only "{batch_dir}".'
         ) from error
+
+    # Si están configuradas las credenciales de Azure Cosmos DB Cassandra, persistir en la nube
+    if os.getenv("CASSANDRA_HOST") and os.getenv("CASSANDRA_PASSWORD"):
+        try:
+            upsert_cassandra(alerts)
+        except Exception as error:
+            print(f"[Aviso] No se pudo cargar en Azure Cassandra: {error}")
 
 
 def main() -> int:

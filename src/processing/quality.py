@@ -116,7 +116,7 @@ def _parse_lines(spark: SparkSession, input_path: Path, normalized_input: bool =
                              StructField("source_raw_line", StringType(), True),
                              StructField("source_line_number", LongType(), True)])
     parsed = (
-        spark.read.text(input_path.as_uri())
+        spark.read.text(input_path.as_posix())
         .select(F.col("value").alias("raw_line"))
         .withColumn("_complete_object", F.lit(True) if normalized_input
                     else _is_complete_json_object(F.col("raw_line")))

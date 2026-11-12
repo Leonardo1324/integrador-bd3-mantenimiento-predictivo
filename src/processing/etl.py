@@ -26,7 +26,7 @@ def read_telemetry(spark: SparkSession, input_path: str | Path) -> DataFrame:
             spark.read.schema(TELEMETRY_SCHEMA)
             .options(**JSON_OPTIONS)
             .option("mode", "FAILFAST")
-            .json(dataset_path.as_uri())
+            .json(dataset_path.as_posix())
         )
         # Spark evalúa de forma diferida: esta acción obliga a leer los datos
         # antes de devolverlos, incluyendo los campos que podrían ser inválidos.
