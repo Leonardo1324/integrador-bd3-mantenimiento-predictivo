@@ -20,7 +20,11 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.storage.load_results import get_cassandra_session, get_pg_connection
+from src.storage.load_results import (
+    fetch_pg_machines,
+    get_cassandra_session,
+    get_pg_connection,
+)
 
 load_dotenv()
 
@@ -205,13 +209,109 @@ def query_postgres_data() -> tuple[bool, pd.DataFrame, pd.DataFrame]:
         return False, pd.DataFrame(), pd.DataFrame()
 
 
-def load_live_metrics(pg_risk_df: pd.DataFrame) -> tuple[list[dict], str]:
-    """Cargar métricas instantáneas del generador en vivo o usar el estado de Azure PostgreSQL."""
+@st.cache_data(ttl=60)
+def load_pg_catalog() -> dict[str, dict[str, str]]:
+    """Cargar catálogo maestro de máquinas (relacional, estable) desde Azure PostgreSQL."""
+    try:
+        rows = fetch_pg_machines()
+        return {row["machine_id"]: row for row in rows}
+    except Exception:
+        return {}
+
+
+@st.cache_resource
+def get_prepared_telemetry_select(_session):
+    """Preparar una sola vez la consulta de lectura rápida en Cassandra telemetry_live."""
+    return _session.prepare(
+        """
+        SELECT machine_id, timestamp, temperature, vibration, pressure,
+               rpm, power_kw, machine_state, risk_level
+        FROM telemetry_live
+        WHERE machine_id = ?
+        LIMIT ?;
+        """
+    )
+
+
+def query_cassandra_telemetry_live(
+    session,
+    catalog_map: dict[str, dict[str, str]],
+    limit_per_machine: int = 30,
+) -> tuple[list[dict], pd.DataFrame]:
+    """Leer las últimas lecturas en vivo directo desde Azure Cosmos DB (telemetry_live)."""
+    if session is None:
+        return [], pd.DataFrame()
+
+    machine_ids = sorted(catalog_map.keys()) if catalog_map else [f"MAQ-{i:03d}" for i in range(1, 6)]
+    try:
+        prepared = get_prepared_telemetry_select(session)
+        cards: list[dict] = []
+        history_rows: list[dict] = []
+
+        for m_id in machine_ids:
+            rows = list(session.execute(prepared, (m_id, limit_per_machine)))
+            if not rows:
+                continue
+
+            meta = catalog_map.get(m_id, {})
+            m_name = meta.get("machine_name", m_id)
+            m_loc = meta.get("location", "Planta Principal")
+
+            latest = rows[0]
+            cards.append(
+                {
+                    "machine_id": m_id,
+                    "machine_name": m_name,
+                    "location": m_loc,
+                    "risk_level": latest.risk_level or "VERDE",
+                    "temperature": float(latest.temperature or 0.0),
+                    "vibration": float(latest.vibration or 0.0),
+                    "pressure": float(latest.pressure or 0.0),
+                    "rpm": int(latest.rpm or 0),
+                    "power_kw": float(latest.power_kw or 0.0),
+                    "machine_state": latest.machine_state or "operating",
+                    "risk_reason": (
+                        f"Lectura en vivo ({latest.timestamp.strftime('%H:%M:%S UTC')})"
+                        if latest.timestamp
+                        else "Lectura en vivo"
+                    ),
+                    "timestamp": latest.timestamp.isoformat() if latest.timestamp else "",
+                }
+            )
+
+            for r in rows:
+                history_rows.append(
+                    {
+                        "machine_id": r.machine_id,
+                        "timestamp": r.timestamp,
+                        "temperature": float(r.temperature or 0.0),
+                        "vibration": float(r.vibration or 0.0),
+                        "pressure": float(r.pressure or 0.0),
+                    }
+                )
+
+        if history_rows:
+            df = pd.DataFrame(history_rows)
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            return cards, df.sort_values("timestamp")
+        return cards, pd.DataFrame()
+    except Exception:
+        return [], pd.DataFrame()
+
+
+def load_live_metrics(
+    cassandra_cards: list[dict],
+    pg_risk_df: pd.DataFrame,
+) -> tuple[list[dict], str]:
+    """Prioridad: 1) Azure Cassandra + Postgres catálogo, 2) Búfer local, 3) Postgres histórico."""
+    if cassandra_cards:
+        return cassandra_cards, "Azure Cassandra (telemetry_live) + Azure Postgres (catálogo)"
+
     if LATEST_METRICS_PATH.exists():
         try:
             content = LATEST_METRICS_PATH.read_text(encoding="utf-8")
             if content.strip():
-                return json.loads(content), "Streaming Local en Vivo"
+                return json.loads(content), "Búfer Local (Fallback)"
         except Exception:
             pass
 
@@ -221,6 +321,8 @@ def load_live_metrics(pg_risk_df: pd.DataFrame) -> tuple[list[dict], str]:
             cards.append(
                 {
                     "machine_id": row["machine_id"],
+                    "machine_name": row.get("machine_name", row["machine_id"]),
+                    "location": row.get("location", "Planta Principal"),
                     "risk_level": row["risk_level"],
                     "temperature": float(row["avg_temp"] or 0.0),
                     "vibration": float(row["max_vibration"] or 0.0),
@@ -230,7 +332,7 @@ def load_live_metrics(pg_risk_df: pd.DataFrame) -> tuple[list[dict], str]:
                     "timestamp": str(row["window_start"] or row["calculated_at"] or ""),
                 }
             )
-        return cards, "Azure Database for PostgreSQL"
+        return cards, "Azure Database for PostgreSQL (Histórico 5m)"
 
     return [], "Sin datos"
 
@@ -297,9 +399,11 @@ def query_cloud_alerts(session, limit: int = 20) -> pd.DataFrame:
 # CONSULTA DE DATOS A LA NUBE
 # ==============================================================================
 pg_connected, pg_risk_df, pg_metrics_df = query_postgres_data()
+catalog_map = load_pg_catalog() if pg_connected else {}
 cluster, session = get_cached_cassandra_connection()
-latest_machines, cards_source = load_live_metrics(pg_risk_df)
-telemetry_df = load_telemetry_history()
+cassandra_cards, cassandra_telemetry_df = query_cassandra_telemetry_live(session, catalog_map)
+latest_machines, cards_source = load_live_metrics(cassandra_cards, pg_risk_df)
+telemetry_df = cassandra_telemetry_df if not cassandra_telemetry_df.empty else load_telemetry_history()
 alerts_df = query_cloud_alerts(session, limit=25)
 blob_configured = bool(
     os.getenv("AZURE_STORAGE_CONNECTION_STRING")
@@ -341,8 +445,8 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("⚙️ Configuración de Vista")
-    auto_refresh = st.checkbox("🔄 Actualización automática", value=False)
-    refresh_rate = st.slider("Intervalo de refresco (segundos)", min_value=2, max_value=15, value=5)
+    auto_refresh = st.checkbox("🔄 Actualización automática", value=True)
+    refresh_rate = st.slider("Intervalo de refresco (segundos)", min_value=2, max_value=15, value=3)
 
     if st.button("⚡ Forzar Actualización Manual", use_container_width=True):
         st.rerun()
@@ -399,6 +503,8 @@ if latest_machines:
     for idx, m in enumerate(latest_machines):
         col = cols[idx % len(cols)]
         m_id = m.get("machine_id", f"MAQ-{idx+1:03d}")
+        m_name = m.get("machine_name", m_id)
+        m_loc = m.get("location", "Planta Principal")
         risk = m.get("risk_level", "VERDE")
         temp = m.get("temperature", 0.0)
         vib = m.get("vibration", 0.0)
@@ -429,7 +535,8 @@ if latest_machines:
                         <h4 style="margin: 0;">{m_id}</h4>
                         <span class="{pill_class}">{risk}</span>
                     </div>
-                    <p style="font-size: 0.8rem; color: #a1a1aa; margin: 4px 0 10px 0;">Origen: <b>{state}</b></p>
+                    <p style="font-size: 0.78rem; color: #e2e8f0; margin: 4px 0 2px 0;"><b>{m_name}</b></p>
+                    <p style="font-size: 0.75rem; color: #94a3b8; margin: 0 0 10px 0;">📍 {m_loc} · {state}</p>
                     <div style="font-size: 0.95rem; line-height: 1.5;">
                         🌡️ <b>Temp:</b> {temp:.1f} °C<br/>
                         〰️ <b>Vib:</b> {vib:.2f} mm/s<br/>
@@ -475,10 +582,10 @@ if not pg_metrics_df.empty:
 else:
     st.warning("No se encontraron registros en `sensor_metrics_5m` de Azure PostgreSQL.")
 
-# Si además está corriendo el simulador en vivo, mostrar sus curvas instantáneas
+# Curvas de telemetría en tiempo real directo desde Azure Cassandra (telemetry_live)
 if not telemetry_df.empty:
     st.markdown("---")
-    st.subheader("📈 Stream de Sensores Segundo a Segundo (Buffer en Vivo)")
+    st.subheader("📈 Stream de Sensores en Tiempo Real (Azure Cassandra: telemetry_live)")
     live_tab1, live_tab2, live_tab3 = st.tabs(["🌡️ Temperatura Vivo", "〰️ Vibración Vivo", "💨 Presión Vivo"])
     with live_tab1:
         st.line_chart(telemetry_df.pivot(index="timestamp", columns="machine_id", values="temperature"))

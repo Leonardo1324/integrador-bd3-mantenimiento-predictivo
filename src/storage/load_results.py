@@ -16,6 +16,7 @@ except ImportError:
     pass
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster
+from cassandra.concurrent import execute_concurrent_with_args
 
 load_dotenv()
 
@@ -50,6 +51,43 @@ def get_pg_connection():
         sslmode=sslmode,
         connect_timeout=15,
     )
+
+
+def fetch_pg_machines() -> list[dict[str, str]]:
+    """Consultar el catálogo maestro de máquinas desde PostgreSQL."""
+    conn = get_pg_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT machine_id, machine_name, location FROM machines ORDER BY machine_id;"
+            )
+            return [
+                {"machine_id": row[0], "machine_name": row[1], "location": row[2]}
+                for row in cur.fetchall()
+            ]
+    finally:
+        conn.close()
+
+
+def ensure_pg_machines(machines: list[tuple[str, str, str]]) -> None:
+    """Asegurar que las máquinas del catálogo existan en PostgreSQL."""
+    if not machines:
+        return
+    conn = get_pg_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO machines (machine_id, machine_name, location)
+                    VALUES %s
+                    ON CONFLICT (machine_id) DO NOTHING;
+                    """,
+                    machines,
+                )
+    finally:
+        conn.close()
 
 
 def get_mongo_client():
@@ -291,6 +329,41 @@ def init_cassandra_alerts_table(session):
 def insert_cassandra_alert_live(session, prepared_insert, machine_id: str, ts_datetime, level: str, description: str):
     """Insertar una alerta individual directamente en Azure Cosmos DB Cassandra."""
     session.execute(prepared_insert, (machine_id, ts_datetime, level, description))
+
+
+def init_cassandra_telemetry_table(session):
+    """Asegurar la tabla de telemetría rápida en vivo y devolver la consulta preparada."""
+    session.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telemetry_live (
+            machine_id text,
+            timestamp timestamp,
+            temperature double,
+            vibration double,
+            pressure double,
+            rpm int,
+            power_kw double,
+            machine_state text,
+            risk_level text,
+            PRIMARY KEY ((machine_id), timestamp)
+        ) WITH CLUSTERING ORDER BY (timestamp DESC);
+        """
+    )
+    return session.prepare(
+        """
+        INSERT INTO telemetry_live (
+            machine_id, timestamp, temperature, vibration, pressure,
+            rpm, power_kw, machine_state, risk_level
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 604800;
+        """
+    )
+
+
+def insert_cassandra_telemetry_batch(session, prepared_insert, rows: list[tuple]) -> None:
+    """Insertar un lote de lecturas en vivo en paralelo sobre Azure Cosmos DB Cassandra."""
+    if not rows:
+        return
+    execute_concurrent_with_args(session, prepared_insert, rows, concurrency=10)
 
 
 def upsert_cassandra(alerts_path: Path):
