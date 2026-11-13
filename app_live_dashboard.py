@@ -109,6 +109,7 @@ def get_cached_cassandra_connection():
         return None, None
 
 def plot_metric(df, value_col, y_label, yellow, red):
+    alt.data_transformers.disable_max_rows()
     data = df[["window_start", "machine_id", value_col]].dropna()
 
     lines = (
@@ -145,7 +146,8 @@ def plot_metric(df, value_col, y_label, yellow, red):
         )
     )
 
-    st.altair_chart((lines + rules).interactive(), use_container_width=True)
+    chart = (lines + rules).resolve_scale(color="independent").interactive()
+    st.altair_chart(chart, use_container_width=True)
 
 def query_postgres_data() -> tuple[bool, pd.DataFrame, pd.DataFrame]:
     """Consultar estados de riesgo actuales y métricas de 5 minutos desde Azure PostgreSQL."""
@@ -561,6 +563,20 @@ st.subheader("🐘 Agregaciones Históricas en Ventanas de 5 Minutos (Azure Post
 st.caption("Datos procesados por PySpark y consultados en vivo desde las tablas `sensor_metrics_5m` y `machine_risk_latest`.")
 
 if not pg_metrics_df.empty:
+    pg_range = st.radio(
+        "Rango de ventanas a graficar",
+        ["Últimas 2 horas", "Últimas 24 horas", "Todo el historial"],
+        horizontal=True,
+        index=0,
+    )
+    max_window = pg_metrics_df["window_start"].max()
+    if pg_range == "Últimas 2 horas":
+        pg_plot_df = pg_metrics_df[pg_metrics_df["window_start"] >= max_window - pd.Timedelta(hours=2)]
+    elif pg_range == "Últimas 24 horas":
+        pg_plot_df = pg_metrics_df[pg_metrics_df["window_start"] >= max_window - pd.Timedelta(hours=24)]
+    else:
+        pg_plot_df = pg_metrics_df
+
     pg_tab1, pg_tab2, pg_tab3, pg_tab4 = st.tabs([
         "🌡️ Temp. Promedio 5m (°C)",
         "〰️ Vibración Máx. 5m (mm/s)",
@@ -569,13 +585,13 @@ if not pg_metrics_df.empty:
     ])
 
     with pg_tab1:
-        plot_metric(pg_metrics_df, "avg_temp", "Temperatura promedio (°C)", 89.5, 94.0)
+        plot_metric(pg_plot_df, "avg_temp", "Temperatura promedio (°C)", 89.5, 94.0)
 
     with pg_tab2:
-        plot_metric(pg_metrics_df, "max_vibration", "Vibración máxima (mm/s)", 6.0, 6.8)
+        plot_metric(pg_plot_df, "max_vibration", "Vibración máxima (mm/s)", 6.0, 6.8)
 
     with pg_tab3:
-        plot_metric(pg_metrics_df, "avg_pressure", "Presión promedio (bar)", 8.0, 8.6)
+        plot_metric(pg_plot_df, "avg_pressure", "Presión promedio (bar)", 8.0, 8.6)
 
     with pg_tab4:
         st.dataframe(pg_risk_df, use_container_width=True, hide_index=True)
