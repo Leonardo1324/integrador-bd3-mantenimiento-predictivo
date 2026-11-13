@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import time
 
@@ -46,6 +48,9 @@ DATA_LIVE_DIR = Path("data/live")
 LATEST_METRICS_PATH = DATA_LIVE_DIR / "latest_metrics.json"
 LIVE_ALERTS_PATH = DATA_LIVE_DIR / "live_alerts.jsonl"
 LIVE_TELEMETRY_PATH = DATA_LIVE_DIR / "telemetry_stream.jsonl"
+LIVE_ARCHIVE_PATH = DATA_LIVE_DIR / "telemetry_archive.jsonl"
+SPARK_SNAPSHOT_PATH = DATA_LIVE_DIR / "spark_microbatch.jsonl"
+SPARK_LOG_PATH = DATA_LIVE_DIR / "spark_last.log"
 
 
 def print_banner(
@@ -130,6 +135,48 @@ def update_live_buffer(
     combined = (existing_lines + new_lines)[-500:]
     LIVE_TELEMETRY_PATH.write_text("\n".join(combined) + "\n", encoding="utf-8")
 
+    # 4. Archivo crudo acumulativo de la sesión para PySpark
+    with LIVE_ARCHIVE_PATH.open("a", encoding="utf-8") as f:
+        for line in new_lines:
+            f.write(line + "\n")
+
+
+def launch_spark_microbatch(no_azure: bool = False) -> subprocess.Popen | None:
+    """Lanzar PySpark en segundo plano sobre una instantánea del archivo acumulado."""
+    if not LIVE_ARCHIVE_PATH.exists():
+        return None
+    shutil.copyfile(LIVE_ARCHIVE_PATH, SPARK_SNAPSHOT_PATH)
+
+    env = os.environ.copy()
+    corretto_21 = Path(r"C:\Users\musimundo\.jdks\corretto-21.0.5")
+    if corretto_21.is_dir():
+        env["JAVA_HOME"] = str(corretto_21)
+        env["PATH"] = f"{corretto_21 / 'bin'};{env.get('PATH', '')}"
+    env["PYSPARK_PYTHON"] = sys.executable
+    env["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "scripts.run_demo",
+        "--input",
+        str(SPARK_SNAPSHOT_PATH),
+        "--allow-window-update",
+    ]
+    if not no_azure:
+        cmd.append("--load")
+
+    log_handle = SPARK_LOG_PATH.open("w", encoding="utf-8")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    proc._log_handle = log_handle  # type: ignore[attr-defined]
+    return proc
+
 
 def run_live_stream(
     interval: float = 2.0,
@@ -137,6 +184,7 @@ def run_live_stream(
     anomaly_rate: float = 0.15,
     max_ticks: int | None = None,
     no_azure: bool = False,
+    spark_every: int = 10,
 ) -> int:
     """Bucle continuo: escribe telemetría y alertas en Azure Cassandra y usa Azure Postgres para catálogo."""
     generator = LiveTelemetryGenerator(machines=machines, anomaly_rate=anomaly_rate)
@@ -178,6 +226,8 @@ def run_live_stream(
     total_alerts_detected = 0
     total_alerts_stored = 0
     total_telemetry_stored = 0
+    spark_runs = 0
+    spark_proc: subprocess.Popen | None = None
     ticks = 0
 
     try:
@@ -185,6 +235,17 @@ def run_live_stream(
             ticks += 1
             tick_now = current_utc_moment()
             now_iso = tick_now.strftime("%H:%M:%S")
+
+            # Verificar si un proceso PySpark previo terminó
+            if spark_proc is not None and spark_proc.poll() is not None:
+                rc = spark_proc.returncode
+                if hasattr(spark_proc, "_log_handle"):
+                    spark_proc._log_handle.close()
+                if rc == 0:
+                    print(f"[{now_iso} UTC] [✅ PYSPARK COMPLETADO] Métricas 5m actualizadas en Azure Postgres + Parquet en Data Lake.")
+                else:
+                    print(f"[{now_iso} UTC] [⚠️ PYSPARK AVISO] Terminó con código {rc}. Ver {SPARK_LOG_PATH}")
+                spark_proc = None
 
             readings = generator.generate_tick(tick_now)
             total_emitted += len(readings)
@@ -248,8 +309,21 @@ def run_live_stream(
                     f"[{now_iso} UTC] {level_tag} {alert['machine_id']}: {alert['description']}{azure_tag}"
                 )
 
-            # Guardar respaldo en búfer local
+            # Guardar respaldo en búfer local (incluye telemetry_archive.jsonl)
             update_live_buffer(readings, tick_alerts, latest_state)
+
+            # Lanzar PySpark micro-batch cada N ciclos sin frenar el streaming
+            if spark_every > 0 and ticks % spark_every == 0:
+                if spark_proc is None:
+                    spark_proc = launch_spark_microbatch(no_azure=no_azure)
+                    if spark_proc is not None:
+                        spark_runs += 1
+                        print(
+                            f"[{now_iso} UTC] [⚡ PYSPARK MICRO-BATCH #{spark_runs}] "
+                            f"Procesando {total_emitted} lecturas acumuladas hacia Azure Postgres + Data Lake..."
+                        )
+                else:
+                    print(f"[{now_iso} UTC] [⏳ PYSPARK] Aún ejecutando lote anterior; se omite este disparo.")
 
             # Resumen de telemetría de este paso
             summary_items = [
@@ -270,6 +344,20 @@ def run_live_stream(
         print("\n[Detención] Señal de interrupción (Ctrl+C) recibida por el usuario.")
 
     finally:
+        if spark_proc is not None:
+            if spark_proc.poll() is None and max_ticks is not None:
+                print("[Espera] Esperando que finalice el micro-batch de PySpark en curso...")
+                try:
+                    spark_proc.wait(timeout=120)
+                except subprocess.TimeoutExpired:
+                    spark_proc.terminate()
+            if hasattr(spark_proc, "_log_handle"):
+                spark_proc._log_handle.close()
+            if spark_proc.poll() == 0:
+                print("[✅ PYSPARK COMPLETADO] Métricas 5m actualizadas en Azure Postgres + Parquet en Data Lake.")
+            elif spark_proc.poll() is not None:
+                print(f"[⚠️ PYSPARK AVISO] Terminó con código {spark_proc.returncode}. Ver {SPARK_LOG_PATH}")
+
         if cluster:
             print("[Cierre] Cerrando conexión con Azure Cosmos DB...")
             cluster.shutdown()
@@ -282,6 +370,7 @@ def run_live_stream(
         print(f"  * Telemetría en Cassandra:       {total_telemetry_stored}")
         print(f"  * Alertas detectadas:            {total_alerts_detected}")
         print(f"  * Alertas insertadas en Azure:   {total_alerts_stored}")
+        print(f"  * Micro-batches PySpark:         {spark_runs}")
         print("=" * 60 + "\n")
 
     return 0
@@ -323,6 +412,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ejecutar únicamente en modo local sin conectar a Azure.",
     )
+    parser.add_argument(
+        "--spark-every",
+        "--spark_every",
+        type=int,
+        default=10,
+        help="Disparar micro-batch de PySpark cada N ciclos (0 para desactivar; por defecto: 10).",
+    )
     return parser
 
 
@@ -335,6 +431,7 @@ def main() -> int:
         anomaly_rate=args.anomaly_rate,
         max_ticks=args.max_ticks,
         no_azure=args.no_azure,
+        spark_every=args.spark_every,
     )
 
 

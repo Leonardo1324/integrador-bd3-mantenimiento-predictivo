@@ -175,7 +175,13 @@ def utc_datetime(value):
     return timestamp.to_pydatetime()
 
 
-def upsert_postgres(metrics_path: Path, risk_path: Path, *, batch_id: str | None = None):
+def upsert_postgres(
+    metrics_path: Path,
+    risk_path: Path,
+    *,
+    batch_id: str | None = None,
+    allow_window_update: bool = False,
+):
     """Cargar las salidas juntas y reservar sus ventanas si se identifica el lote."""
     df_metrics = load_dataframe(metrics_path)
     df_risk = load_dataframe(risk_path)
@@ -221,9 +227,14 @@ def upsert_postgres(metrics_path: Path, risk_path: Path, *, batch_id: str | None
                     machine_rows,
                 )
 
+                metrics_where = (
+                    ""
+                    if allow_window_update
+                    else "WHERE current.batch_id IS NOT DISTINCT FROM EXCLUDED.batch_id"
+                )
                 accepted = execute_values(
                     cur,
-                    """
+                    f"""
                     INSERT INTO sensor_metrics_5m AS current
                         (machine_id, window_start, avg_temp, max_vibration, avg_pressure, n_readings, batch_id)
                     VALUES %s
@@ -231,8 +242,9 @@ def upsert_postgres(metrics_path: Path, risk_path: Path, *, batch_id: str | None
                         avg_temp = EXCLUDED.avg_temp,
                         max_vibration = EXCLUDED.max_vibration,
                         avg_pressure = EXCLUDED.avg_pressure,
-                        n_readings = EXCLUDED.n_readings
-                    WHERE current.batch_id IS NOT DISTINCT FROM EXCLUDED.batch_id
+                        n_readings = EXCLUDED.n_readings,
+                        batch_id = EXCLUDED.batch_id
+                    {metrics_where}
                     RETURNING machine_id, window_start;
                     """,
                     metrics_rows,
@@ -243,9 +255,10 @@ def upsert_postgres(metrics_path: Path, risk_path: Path, *, batch_id: str | None
                     machine, window = min(conflicts)
                     raise ValueError(f"Ventana de otro lote o sin propietario: {machine} / {window.isoformat()}.")
 
+                risk_cmp = ">=" if allow_window_update else ">"
                 execute_values(
                     cur,
-                    """
+                    f"""
                     INSERT INTO machine_risk_latest AS current
                         (machine_id, calculated_at, risk_level, risk_reason, window_start)
                     VALUES %s
@@ -254,7 +267,7 @@ def upsert_postgres(metrics_path: Path, risk_path: Path, *, batch_id: str | None
                         risk_level = EXCLUDED.risk_level,
                         risk_reason = EXCLUDED.risk_reason,
                         window_start = EXCLUDED.window_start
-                    WHERE EXCLUDED.window_start > current.window_start
+                    WHERE EXCLUDED.window_start {risk_cmp} current.window_start
                         OR (EXCLUDED.window_start IS NULL AND current.window_start IS NULL);
                     """,
                     risk_rows,

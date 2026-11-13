@@ -100,7 +100,7 @@ def prepare_batch(work_dir: Path, input_path: Path | None, start_time: str, seed
         return batch_dir
 
 
-def load_batch(batch_dir: Path, batch_id: str) -> None:
+def load_batch(batch_dir: Path, batch_id: str, *, allow_window_update: bool = False) -> None:
     """Cargar un lote exportado en Azure PostgreSQL, Azure Cassandra y Azure Blob Storage."""
     from psycopg2 import Error as PostgreSQLError
     from src.storage.load_results import (
@@ -117,7 +117,12 @@ def load_batch(batch_dir: Path, batch_id: str) -> None:
 
     # 1. Carga en Azure PostgreSQL
     try:
-        upsert_postgres(results / METRICS_FILE, results / RISK_FILE, batch_id=batch_id)
+        upsert_postgres(
+            results / METRICS_FILE,
+            results / RISK_FILE,
+            batch_id=batch_id,
+            allow_window_update=allow_window_update,
+        )
     except PostgreSQLError as error:
         raise RuntimeError(
             f'Falló la carga en PostgreSQL. Corregí el error y reintentá con --load-only "{batch_dir}".'
@@ -158,6 +163,11 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--load", action="store_true", help="Cargar el lote exportado en Azure y bases configuradas.")
     mode.add_argument("--load-only", type=Path, help="Cargar o reintentar a partir de un directorio de lote existente.")
+    parser.add_argument(
+        "--allow-window-update",
+        action="store_true",
+        help="Permitir actualizar ventanas de 5m en curso desde micro-lotes en vivo.",
+    )
     args = parser.parse_args()
 
     try:
@@ -171,7 +181,7 @@ def main() -> int:
         print(f"Lote exportado en {batch_dir}", flush=True)
         print(json.dumps(manifest, indent=2), flush=True)
         if args.load or args.load_only:
-            load_batch(batch_dir, manifest["batch_id"])
+            load_batch(batch_dir, manifest["batch_id"], allow_window_update=args.allow_window_update)
     except (ValueError, OSError, RuntimeError) as error:
         parser.exit(1, f"Error: {error}\n" + (f"Detalle: {error.__cause__}\n" if error.__cause__ else ""))
     return 0
